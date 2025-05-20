@@ -4,9 +4,11 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log"
 	"net/http"
 	"os"
+	"time"
 
 	"github.com/Masterminds/squirrel"
 	"github.com/joho/godotenv"
@@ -22,10 +24,12 @@ type Comment struct {
 }
 
 func main() {
+	// Load environment variables
 	if err := godotenv.Load(); err != nil {
 		log.Fatalf("Error loading .env file: %v", err)
 	}
 
+	// Construct the Data Source Name (DSN)
 	dsn := fmt.Sprintf(
 		"host=localhost port=%s dbname=%s user=%s password=%s sslmode=disable",
 		os.Getenv("PG_PORT"),
@@ -34,62 +38,108 @@ func main() {
 		os.Getenv("PG_PASSWORD"),
 	)
 
+	// Open a connection to the database
 	db, err := sql.Open("postgres", dsn)
 	if err != nil {
 		log.Fatalf("Error opening database connection: %v", err)
 	}
-	defer db.Close()
+	defer func(db *sql.DB) {
+		err := db.Close()
+		if err != nil {
+			log.Fatalf("Error closing database connection: %v", err)
+		}
+	}(db)
 
+	// Verify the connection to the database
 	if err := db.Ping(); err != nil {
 		log.Fatalf("Error pinging database: %v", err)
 	}
 
-	for i := 0; i < 5; i++ {
-		start := i * 100
-		url := fmt.Sprintf("https://jsonplaceholder.typicode.com/comments?_start=%d&_limit=100", start)
+	// Define batch size and starting point
+	batchSize := 50
+	start := 0
+
+	for {
+		// Construct the API URL with pagination parameters
+		url := fmt.Sprintf("https://jsonplaceholder.typicode.com/comments?_start=%d&_limit=%d", start, batchSize)
+
+		// Make the HTTP GET request
 		resp, err := http.Get(url)
 		if err != nil {
-			log.Fatalf("Error fetching batch %d: %v", i, err)
+			log.Fatalf("Error fetching data from API: %v", err)
 		}
-		defer resp.Body.Close()
 
+		// Ensure the response body is closed after processing
+		defer func(Body io.ReadCloser) {
+			err := Body.Close()
+			if err != nil {
+				log.Fatalf("Error closing response body: %v", err)
+			}
+		}(resp.Body)
+
+		// Check for a successful response
 		if resp.StatusCode != http.StatusOK {
-			log.Fatalf("Unexpected status code %d for batch %d", resp.StatusCode, i)
+			log.Fatalf("Unexpected status code: %d", resp.StatusCode)
 		}
 
+		// Decode the JSON response into a slice of Comment structs
 		var comments []Comment
 		if err := json.NewDecoder(resp.Body).Decode(&comments); err != nil {
-			log.Fatalf("Error decoding batch %d: %v", i, err)
+			log.Fatalf("Error decoding JSON response: %v", err)
 		}
 
+		// Break the loop if no more comments are returned
+		if len(comments) == 0 {
+			log.Println("No more comments to process. Exiting loop.")
+			break
+		}
+
+		// Begin a new transaction
 		tx, err := db.Begin()
 		if err != nil {
-			log.Fatalf("Error starting transaction for batch %d: %v", i, err)
+			log.Fatalf("Error starting transaction: %v", err)
 		}
 
+		// Build the SQL insert statement using squirrel
 		qb := squirrel.Insert("comments").
 			Columns("post_id", "id", "name", "email", "body").
 			PlaceholderFormat(squirrel.Dollar)
 
+		// Add values to the insert statement
 		for _, comment := range comments {
 			qb = qb.Values(comment.PostID, comment.ID, comment.Name, comment.Email, comment.Body)
 		}
 
-		sql, args, err := qb.ToSql()
+		// Generate the SQL and arguments
+		sqlStr, args, err := qb.ToSql()
 		if err != nil {
-			tx.Rollback()
-			log.Fatalf("Error building SQL for batch %d: %v", i, err)
+			err := tx.Rollback()
+			if err != nil {
+				return
+			}
+			log.Fatalf("Error building SQL statement: %v", err)
 		}
 
-		if _, err := tx.Exec(sql, args...); err != nil {
-			tx.Rollback()
-			log.Fatalf("Error inserting batch %d: %v", i, err)
+		// Execute the insert statement
+		if _, err := tx.Exec(sqlStr, args...); err != nil {
+			err := tx.Rollback()
+			if err != nil {
+				return
+			}
+			log.Fatalf("Error executing insert statement: %v", err)
 		}
 
+		// Commit the transaction
 		if err := tx.Commit(); err != nil {
-			log.Fatalf("Error committing transaction for batch %d: %v", i, err)
+			log.Fatalf("Error committing transaction: %v", err)
 		}
 
-		log.Printf("Successfully inserted batch %d with %d comments", i, len(comments))
+		log.Printf("Successfully inserted batch starting at %d with %d comments", start, len(comments))
+
+		// Increment the starting point for the next batch
+		start += batchSize
+		time.Sleep(1 * time.Second)
 	}
 }
+
+// TODO: add validation
